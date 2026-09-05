@@ -1,0 +1,121 @@
+-- Drop old objects
+DROP TABLE IF EXISTS public.submissions CASCADE;
+DROP TABLE IF EXISTS public.user_roles CASCADE;
+DROP TABLE IF EXISTS public.profiles CASCADE;
+DROP TABLE IF EXISTS public.audit_log CASCADE;
+DROP FUNCTION IF EXISTS public.handle_new_user() CASCADE;
+DROP FUNCTION IF EXISTS public.has_role(uuid, public.app_role) CASCADE;
+DROP TYPE IF EXISTS public.app_role CASCADE;
+
+-- Enum
+CREATE TYPE public.app_role AS ENUM ('owner', 'admin', 'member');
+
+-- Profiles
+CREATE TABLE public.profiles (
+  id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  email text NOT NULL,
+  full_name text,
+  approved boolean NOT NULL DEFAULT false,
+  approved_at timestamptz,
+  approved_by uuid REFERENCES auth.users(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+GRANT SELECT, INSERT, UPDATE ON public.profiles TO authenticated;
+GRANT ALL ON public.profiles TO service_role;
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+
+-- User roles
+CREATE TABLE public.user_roles (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  role public.app_role NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (user_id, role)
+);
+GRANT SELECT, INSERT, DELETE ON public.user_roles TO authenticated;
+GRANT ALL ON public.user_roles TO service_role;
+ALTER TABLE public.user_roles ENABLE ROW LEVEL SECURITY;
+
+CREATE UNIQUE INDEX one_owner_only ON public.user_roles(role) WHERE role = 'owner';
+
+-- Role check function
+CREATE OR REPLACE FUNCTION public.has_role(_user_id uuid, _role public.app_role)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT EXISTS (SELECT 1 FROM public.user_roles WHERE user_id = _user_id AND role = _role)
+$$;
+
+-- Submissions
+CREATE TABLE public.submissions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  email text NOT NULL,
+  full_name text,
+  earned_count integer NOT NULL DEFAULT 0,
+  checked jsonb NOT NULL DEFAULT '{}'::jsonb,
+  counts jsonb NOT NULL DEFAULT '{}'::jsonb,
+  advance jsonb NOT NULL DEFAULT '{}'::jsonb,
+  earned_badges jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+GRANT SELECT, INSERT ON public.submissions TO authenticated;
+GRANT ALL ON public.submissions TO service_role;
+ALTER TABLE public.submissions ENABLE ROW LEVEL SECURITY;
+
+-- Audit log
+CREATE TABLE public.audit_log (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  actor_id uuid NOT NULL REFERENCES auth.users(id),
+  target_id uuid NOT NULL REFERENCES auth.users(id),
+  action text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+GRANT SELECT, INSERT ON public.audit_log TO authenticated;
+GRANT ALL ON public.audit_log TO service_role;
+ALTER TABLE public.audit_log ENABLE ROW LEVEL SECURITY;
+
+-- Policies: profiles
+CREATE POLICY "self read profile" ON public.profiles FOR SELECT TO authenticated USING (auth.uid() = id);
+CREATE POLICY "self update profile" ON public.profiles FOR UPDATE TO authenticated USING (auth.uid() = id);
+CREATE POLICY "staff read profiles" ON public.profiles FOR SELECT TO authenticated USING (public.has_role(auth.uid(),'owner') OR public.has_role(auth.uid(),'admin'));
+CREATE POLICY "staff update profiles" ON public.profiles FOR UPDATE TO authenticated USING (public.has_role(auth.uid(),'owner') OR public.has_role(auth.uid(),'admin')) WITH CHECK (public.has_role(auth.uid(),'owner') OR public.has_role(auth.uid(),'admin'));
+
+-- Policies: user_roles
+CREATE POLICY "self read role" ON public.user_roles FOR SELECT TO authenticated USING (auth.uid() = user_id);
+CREATE POLICY "staff read roles" ON public.user_roles FOR SELECT TO authenticated USING (public.has_role(auth.uid(),'owner') OR public.has_role(auth.uid(),'admin'));
+CREATE POLICY "staff insert admin role" ON public.user_roles FOR INSERT TO authenticated WITH CHECK (role = 'admin' AND (public.has_role(auth.uid(),'owner') OR public.has_role(auth.uid(),'admin')));
+CREATE POLICY "staff delete admin role" ON public.user_roles FOR DELETE TO authenticated USING (role = 'admin' AND (public.has_role(auth.uid(),'owner') OR public.has_role(auth.uid(),'admin')));
+
+-- Policies: submissions
+CREATE POLICY "self read submission" ON public.submissions FOR SELECT TO authenticated USING (auth.uid() = user_id);
+CREATE POLICY "staff read submissions" ON public.submissions FOR SELECT TO authenticated USING (public.has_role(auth.uid(),'owner') OR public.has_role(auth.uid(),'admin'));
+CREATE POLICY "self insert submission" ON public.submissions FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id AND EXISTS (SELECT 1 FROM public.profiles p WHERE p.id = auth.uid() AND p.approved = true));
+
+-- Policies: audit_log
+CREATE POLICY "staff read audit" ON public.audit_log FOR SELECT TO authenticated USING (public.has_role(auth.uid(),'owner') OR public.has_role(auth.uid(),'admin'));
+CREATE POLICY "staff insert audit" ON public.audit_log FOR INSERT TO authenticated WITH CHECK (actor_id = auth.uid() AND (public.has_role(auth.uid(),'owner') OR public.has_role(auth.uid(),'admin')));
+
+-- New user trigger: first user becomes owner (auto-approved), rest are members pending approval
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE is_first boolean;
+BEGIN
+  SELECT NOT EXISTS (SELECT 1 FROM public.user_roles WHERE role = 'owner') INTO is_first;
+  INSERT INTO public.profiles (id, email, full_name, approved, approved_at)
+  VALUES (NEW.id, NEW.email,
+    COALESCE(NEW.raw_user_meta_data->>'full_name', NEW.raw_user_meta_data->>'name'),
+    is_first, CASE WHEN is_first THEN now() ELSE NULL END);
+  IF is_first THEN
+    INSERT INTO public.user_roles (user_id, role) VALUES (NEW.id, 'owner') ON CONFLICT DO NOTHING;
+  ELSE
+    INSERT INTO public.user_roles (user_id, role) VALUES (NEW.id, 'member') ON CONFLICT DO NOTHING;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_auth_user_created
+AFTER INSERT ON auth.users
+FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
