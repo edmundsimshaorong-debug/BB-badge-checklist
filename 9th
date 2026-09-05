@@ -1,0 +1,5 @@
+ALTER TABLE public.submissions ADD COLUMN rank text;
+
+CREATE POLICY "Submissions rank update" ON public.submissions FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+
+COMMENT ON COLUMN public.submissions.rank IS 'Member rank at time of submission';
