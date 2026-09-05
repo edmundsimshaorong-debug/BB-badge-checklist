@@ -1,0 +1,53 @@
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path TO public AS $function$
+DECLARE is_first_user boolean;
+BEGIN
+  SELECT NOT EXISTS (SELECT 1 FROM public.user_roles WHERE role = 'owner') INTO is_first_user;
+  INSERT INTO public.profiles (id, email, full_name, approved, approved_at, approved_by)
+  VALUES (NEW.id, NEW.email,
+    COALESCE(NEW.raw_user_meta_data->>'full_name', NEW.raw_user_meta_data->>'name'),
+    is_first_user,
+    CASE WHEN is_first_user THEN now() END,
+    CASE WHEN is_first_user THEN NEW.id END);
+  IF is_first_user THEN
+    INSERT INTO public.user_roles (user_id, role) VALUES (NEW.id, 'owner') ON CONFLICT DO NOTHING;
+  ELSE
+    INSERT INTO public.user_roles (user_id, role) VALUES (NEW.id, 'member') ON CONFLICT DO NOTHING;
+  END IF;
+  RETURN NEW;
+END;
+$function$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+CREATE OR REPLACE FUNCTION public.log_profile_update()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+  IF NEW.approved = true AND OLD.approved = false THEN
+    INSERT INTO public.audit_log(actor_id, target_id, action)
+    VALUES (auth.uid(), NEW.id, 'approved member');
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_profile_update ON public.profiles;
+CREATE TRIGGER on_profile_update AFTER UPDATE ON public.profiles
+FOR EACH ROW EXECUTE FUNCTION public.log_profile_update();
+
+CREATE OR REPLACE FUNCTION public.log_role_delete()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+  IF OLD.role = 'admin' THEN
+    INSERT INTO public.audit_log(actor_id, target_id, action)
+    VALUES (auth.uid(), OLD.user_id, 'removed admin');
+  END IF;
+  RETURN OLD;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_role_delete ON public.user_roles;
+CREATE TRIGGER on_role_delete AFTER DELETE ON public.user_roles
+FOR EACH ROW EXECUTE FUNCTION public.log_role_delete();
