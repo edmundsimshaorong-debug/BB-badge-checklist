@@ -1,0 +1,154 @@
+
+-- Helper: highest-privilege checks
+CREATE OR REPLACE FUNCTION public.is_owner(_user_id uuid)
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT EXISTS (SELECT 1 FROM public.user_roles WHERE user_id = _user_id AND role = 'owner')
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_super_admin(_user_id uuid)
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT EXISTS (SELECT 1 FROM public.user_roles WHERE user_id = _user_id AND role IN ('owner','super_admin'))
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_staff(_user_id uuid)
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT EXISTS (SELECT 1 FROM public.user_roles WHERE user_id = _user_id AND role IN ('owner','super_admin','admin'))
+$$;
+
+REVOKE EXECUTE ON FUNCTION public.has_role(uuid, public.app_role) FROM anon, public;
+GRANT EXECUTE ON FUNCTION public.has_role(uuid, public.app_role) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION public.is_owner(uuid) FROM anon, public;
+GRANT EXECUTE ON FUNCTION public.is_owner(uuid) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION public.is_super_admin(uuid) FROM anon, public;
+GRANT EXECUTE ON FUNCTION public.is_super_admin(uuid) TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION public.is_staff(uuid) FROM anon, public;
+GRANT EXECUTE ON FUNCTION public.is_staff(uuid) TO authenticated, service_role;
+
+-- Role requests
+CREATE TABLE public.role_requests (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  target_user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  requested_role public.app_role NOT NULL,
+  requested_by uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  status text NOT NULL DEFAULT 'pending',
+  decided_by uuid REFERENCES auth.users(id) ON DELETE SET NULL,
+  decided_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT role_requests_role_chk CHECK (requested_role IN ('admin','super_admin')),
+  CONSTRAINT role_requests_status_chk CHECK (status IN ('pending','approved','rejected'))
+);
+
+CREATE UNIQUE INDEX role_requests_one_pending
+  ON public.role_requests (target_user_id, requested_role)
+  WHERE status = 'pending';
+
+GRANT SELECT, INSERT, UPDATE ON public.role_requests TO authenticated;
+GRANT ALL ON public.role_requests TO service_role;
+
+ALTER TABLE public.role_requests ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "staff read role requests" ON public.role_requests
+  FOR SELECT TO authenticated
+  USING (public.is_staff(auth.uid()) OR target_user_id = auth.uid());
+
+CREATE POLICY "staff create role requests" ON public.role_requests
+  FOR INSERT TO authenticated
+  WITH CHECK (requested_by = auth.uid() AND public.is_staff(auth.uid()) AND status = 'pending');
+
+CREATE OR REPLACE FUNCTION public.update_updated_at_column()
+RETURNS trigger LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END;
+$$;
+
+CREATE TRIGGER role_requests_updated_at
+  BEFORE UPDATE ON public.role_requests
+  FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+-- Decide a request (approve/reject) with privilege checks
+CREATE OR REPLACE FUNCTION public.decide_role_request(_request_id uuid, _approve boolean)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE r public.role_requests%ROWTYPE;
+BEGIN
+  SELECT * INTO r FROM public.role_requests WHERE id = _request_id AND status = 'pending';
+  IF NOT FOUND THEN RAISE EXCEPTION 'Request not found or already decided'; END IF;
+
+  IF r.requested_role = 'super_admin' THEN
+    IF NOT public.is_owner(auth.uid()) THEN
+      RAISE EXCEPTION 'Only the owner can approve a super admin promotion';
+    END IF;
+  ELSE
+    IF NOT public.is_super_admin(auth.uid()) THEN
+      RAISE EXCEPTION 'Only the owner or a super admin can approve an admin promotion';
+    END IF;
+  END IF;
+
+  UPDATE public.role_requests
+     SET status = CASE WHEN _approve THEN 'approved' ELSE 'rejected' END,
+         decided_by = auth.uid(), decided_at = now()
+   WHERE id = r.id;
+
+  IF _approve THEN
+    INSERT INTO public.user_roles (user_id, role) VALUES (r.target_user_id, r.requested_role)
+    ON CONFLICT DO NOTHING;
+    IF r.requested_role = 'super_admin' THEN
+      DELETE FROM public.user_roles WHERE user_id = r.target_user_id AND role = 'admin';
+    END IF;
+    INSERT INTO public.audit_log(actor_id, target_id, action)
+    VALUES (auth.uid(), r.target_user_id, 'approved ' || r.requested_role::text || ' promotion');
+  ELSE
+    INSERT INTO public.audit_log(actor_id, target_id, action)
+    VALUES (auth.uid(), r.target_user_id, 'rejected ' || r.requested_role::text || ' promotion');
+  END IF;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION public.decide_role_request(uuid, boolean) FROM anon, public;
+GRANT EXECUTE ON FUNCTION public.decide_role_request(uuid, boolean) TO authenticated;
+
+-- Tighten user_roles write policies
+DROP POLICY IF EXISTS "staff insert admin role" ON public.user_roles;
+DROP POLICY IF EXISTS "staff delete admin role" ON public.user_roles;
+
+-- Only owner/super admin may grant admin directly; only owner may grant super admin directly
+CREATE POLICY "privileged insert roles" ON public.user_roles
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    (role = 'admin' AND public.is_super_admin(auth.uid()))
+    OR (role = 'super_admin' AND public.is_owner(auth.uid()))
+  );
+
+CREATE POLICY "privileged delete roles" ON public.user_roles
+  FOR DELETE TO authenticated
+  USING (
+    (role = 'admin' AND public.is_super_admin(auth.uid()))
+    OR (role = 'super_admin' AND public.is_owner(auth.uid()))
+  );
+
+-- Super admins get staff read access everywhere
+CREATE POLICY "super admin read profiles" ON public.profiles
+  FOR SELECT TO authenticated USING (public.is_super_admin(auth.uid()));
+CREATE POLICY "super admin update profiles" ON public.profiles
+  FOR UPDATE TO authenticated USING (public.is_super_admin(auth.uid()))
+  WITH CHECK (public.is_super_admin(auth.uid()));
+CREATE POLICY "super admin read roles" ON public.user_roles
+  FOR SELECT TO authenticated USING (public.is_super_admin(auth.uid()));
+CREATE POLICY "super admin read submissions" ON public.submissions
+  FOR SELECT TO authenticated USING (public.is_super_admin(auth.uid()));
+CREATE POLICY "super admin read audit" ON public.audit_log
+  FOR SELECT TO authenticated USING (public.is_super_admin(auth.uid()));
+CREATE POLICY "super admin insert audit" ON public.audit_log
+  FOR INSERT TO authenticated
+  WITH CHECK (actor_id = auth.uid() AND public.is_super_admin(auth.uid()));
+
+-- Log super admin removal too
+CREATE OR REPLACE FUNCTION public.log_role_delete()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+  IF OLD.role IN ('admin','super_admin') THEN
+    INSERT INTO public.audit_log(actor_id, target_id, action)
+    VALUES (auth.uid(), OLD.user_id, 'removed ' || OLD.role::text);
+  END IF;
+  RETURN OLD;
+END;
+$$;
