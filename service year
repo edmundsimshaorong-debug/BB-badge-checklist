@@ -1,0 +1,3 @@
+ALTER TABLE public.submissions ADD COLUMN IF NOT EXISTS service_year INTEGER;
+
+COMMENT ON COLUMN public.submissions.service_year IS 'Member service year, 1–8';
