@@ -1,0 +1,47 @@
+-- 1. Keep submission history: allow multiple submissions per member
+ALTER TABLE public.submissions DROP CONSTRAINT IF EXISTS submissions_user_id_key;
+
+-- 2. Super admins act without owner approval
+DROP POLICY IF EXISTS "privileged insert roles" ON public.user_roles;
+CREATE POLICY "privileged insert roles" ON public.user_roles
+FOR INSERT TO authenticated
+WITH CHECK (
+  role IN ('admin'::app_role, 'super_admin'::app_role)
+  AND (public.is_super_admin(auth.uid()) OR public.is_owner(auth.uid()))
+);
+
+DROP POLICY IF EXISTS "privileged delete roles" ON public.user_roles;
+CREATE POLICY "privileged delete roles" ON public.user_roles
+FOR DELETE TO authenticated
+USING (
+  (role = 'admin'::app_role AND (public.is_super_admin(auth.uid()) OR public.is_owner(auth.uid())))
+  OR (role = 'super_admin'::app_role AND (public.is_super_admin(auth.uid()) OR public.is_owner(auth.uid())))
+);
+
+-- 3. Remove member (owner or super admin only)
+CREATE OR REPLACE FUNCTION public.remove_member(_user_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NOT (public.is_owner(auth.uid()) OR public.is_super_admin(auth.uid())) THEN
+    RAISE EXCEPTION 'Only the owner or a super admin can remove a member';
+  END IF;
+  IF _user_id = auth.uid() THEN
+    RAISE EXCEPTION 'You cannot remove yourself';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.user_roles ur WHERE ur.user_id = _user_id AND ur.role IN ('owner'::app_role, 'super_admin'::app_role)) THEN
+    RAISE EXCEPTION 'This user is protected and cannot be removed';
+  END IF;
+  DELETE FROM public.submissions WHERE user_id = _user_id;
+  DELETE FROM public.role_requests WHERE target_user_id = _user_id OR requested_by = _user_id;
+  DELETE FROM public.audit_log WHERE target_id = _user_id OR actor_id = _user_id;
+  DELETE FROM public.user_roles WHERE user_id = _user_id;
+  DELETE FROM auth.users WHERE id = _user_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.remove_member(uuid) FROM public;
+GRANT EXECUTE ON FUNCTION public.remove_member(uuid) TO authenticated;
