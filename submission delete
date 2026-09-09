@@ -1,0 +1,62 @@
+-- 1) Owner / super admin can delete submissions
+CREATE POLICY "super admin delete submissions" ON public.submissions
+FOR DELETE TO authenticated
+USING (public.is_super_admin(auth.uid()));
+
+-- 2) Owner can grant the owner role
+DROP POLICY IF EXISTS "privileged insert roles" ON public.user_roles;
+CREATE POLICY "privileged insert roles" ON public.user_roles
+FOR INSERT TO authenticated
+WITH CHECK (
+  ((role = ANY (ARRAY['admin'::app_role, 'super_admin'::app_role])) AND (public.is_super_admin(auth.uid()) OR public.is_owner(auth.uid())))
+  OR ((role = 'owner'::app_role) AND public.is_owner(auth.uid()))
+);
+
+-- 3) Fully clean up a removed member so the email can be reused
+CREATE OR REPLACE FUNCTION public.remove_member(_user_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF NOT (public.is_owner(auth.uid()) OR public.is_super_admin(auth.uid())) THEN
+    RAISE EXCEPTION 'Only the owner or a super admin can remove a member';
+  END IF;
+  IF _user_id = auth.uid() THEN
+    RAISE EXCEPTION 'You cannot remove yourself';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.user_roles ur WHERE ur.user_id = _user_id AND ur.role IN ('owner'::app_role, 'super_admin'::app_role)) THEN
+    RAISE EXCEPTION 'This user is protected and cannot be removed';
+  END IF;
+  DELETE FROM public.submissions WHERE user_id = _user_id;
+  DELETE FROM public.role_requests WHERE target_user_id = _user_id OR requested_by = _user_id OR decided_by = _user_id;
+  DELETE FROM public.audit_log WHERE target_id = _user_id OR actor_id = _user_id;
+  DELETE FROM public.user_roles WHERE user_id = _user_id;
+  UPDATE public.profiles SET approved_by = NULL WHERE approved_by = _user_id;
+  DELETE FROM public.profiles WHERE id = _user_id;
+  DELETE FROM auth.identities WHERE user_id = _user_id;
+  DELETE FROM auth.sessions WHERE user_id = _user_id;
+  DELETE FROM auth.users WHERE id = _user_id;
+END;
+$function$;
+
+-- 4) Delete a submission (owner / super admin) with audit trail
+CREATE OR REPLACE FUNCTION public.delete_submission(_submission_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $function$
+DECLARE s public.submissions%ROWTYPE;
+BEGIN
+  IF NOT public.is_super_admin(auth.uid()) THEN
+    RAISE EXCEPTION 'Only the owner or a super admin can remove a result';
+  END IF;
+  SELECT * INTO s FROM public.submissions WHERE id = _submission_id;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Result not found'; END IF;
+  DELETE FROM public.submissions WHERE id = _submission_id;
+  INSERT INTO public.audit_log(actor_id, target_id, action)
+  VALUES (auth.uid(), s.user_id, 'removed a submitted result');
+END;
+$function$;
